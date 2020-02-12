@@ -4,10 +4,12 @@
 
 import os
 import sys
+import socket
 import pkgutil
 import logging
 import tempfile
 import xmlrpclib
+import hashlib
 import traceback
 import urllib
 import urllib2
@@ -18,9 +20,11 @@ from lib.api.process import Process
 from lib.common.abstracts import Package, Auxiliary
 from lib.common.constants import PATHS
 from lib.common.exceptions import CuckooError, CuckooPackageError
+from lib.common.hashing import hash_file
 from lib.common.results import upload_to_host
 from lib.core.config import Config
 from lib.core.startup import create_folders, init_logging
+from lib.core.stapserver import STAPServer, STAPDispatcher
 from modules import auxiliary
 
 log = logging.getLogger()
@@ -44,10 +48,160 @@ def add_pids(pids):
             PROCESS_LIST.add(pid)
         SEEN_LIST.add(pid)
 
-def dump_files():
-    """Dump all the dropped files."""
-    for file_path in FILES_LIST:
-        log.info("PLS IMPLEMENT DUMP, want to dump %s", file_path)
+
+class Files(object):
+    PROTECTED_NAMES = ()
+
+    def __init__(self):
+        self.files = {}
+        self.files_orig = {}
+        self.dumped = []
+
+    def is_protected_filename(self, file_name):
+        """Return whether or not to inject into a process with this name."""
+        return file_name.lower() in self.PROTECTED_NAMES
+
+    def add_pid(self, filepath, pid, verbose=True):
+        """Track a process identifier for this file."""
+        if not pid or filepath.lower() not in self.files:
+            return
+
+        if pid not in self.files[filepath.lower()]:
+            self.files[filepath.lower()].append(pid)
+            verbose and log.info("Added pid %s for %r", pid, filepath)
+
+    def add_file(self, filepath, pid=None):
+        """Add filepath to the list of files and track the pid."""
+        if filepath.lower() not in self.files:
+            log.info(
+                "Added new file to list with pid %s and path %s",
+                pid, filepath.encode("utf8")
+            )
+            self.files[filepath.lower()] = []
+            self.files_orig[filepath.lower()] = filepath
+
+        self.add_pid(filepath, pid, verbose=False)
+
+    def dump_file(self, filepath):
+        """Dump a file to the host."""
+        if not os.path.isfile(filepath):
+            log.warning("File at path %r does not exist, skip.", filepath)
+            return False
+
+        # Check whether we've already dumped this file - in that case skip it.
+        try:
+            sha256 = hash_file(hashlib.sha256, filepath)
+            if sha256 in self.dumped:
+                return
+        except IOError as e:
+            log.info("Error dumping file from path \"%s\": %s", filepath, e)
+            return
+
+        filename = "%s_%s" % (sha256[:16], os.path.basename(filepath))
+        upload_path = os.path.join("files", filename)
+
+        try:
+            upload_to_host(
+                # If available use the original filepath, the one that is
+                # not lowercased.
+                self.files_orig.get(filepath.lower(), filepath),
+                upload_path, self.files.get(filepath.lower(), [])
+            )
+            self.dumped.append(sha256)
+        except (IOError, socket.error) as e:
+            log.error(
+                "Unable to upload dropped file at path \"%s\": %s",
+                filepath, e
+            )
+
+    def delete_file(self, filepath, pid=None):
+        """A file is about to removed and thus should be dumped right away."""
+        self.add_pid(filepath, pid)
+        self.dump_file(filepath)
+
+        # Remove the filepath from the files list.
+        self.files.pop(filepath.lower(), None)
+        self.files_orig.pop(filepath.lower(), None)
+
+    def move_file(self, oldfilepath, newfilepath, pid=None):
+        """A file will be moved - track this change."""
+        self.add_pid(oldfilepath, pid)
+        if oldfilepath.lower() in self.files:
+            # Replace the entry with the new filepath.
+            self.files[newfilepath.lower()] = \
+                self.files.pop(oldfilepath.lower(), [])
+
+    def dump_files(self):
+        """Dump all pending files."""
+        while self.files:
+            self.delete_file(self.files.keys()[0])
+
+
+class CommandSTAPHandler():
+    """STAP Handler.
+
+    This class handles the notifications received through the STAP stdout and
+    decides what to do with them.
+    """
+    ignore_list = dict(pid=[])
+
+    def __init__(self, analyzer):
+        self.analyzer = analyzer
+        self.tracked = {}
+
+    def _handle_file_new(self, data):
+        """Notification of a new dropped file."""
+        self.analyzer.files.add_file(data.decode("utf8"), self.pid)
+
+    def _handle_file_del(self, data):
+        """Notification of a file being removed (if it exists) - we have to
+        dump it before it's being removed."""
+        filepath = data.decode("utf8")
+        if os.path.exists(filepath):
+            self.analyzer.files.delete_file(filepath, self.pid)
+
+    def _handle_file_move(self, data):
+        """A file is being moved - track these changes."""
+        if "::" not in data:
+            log.warning("Received FILE_MOVE command from monitor with an "
+                        "incorrect argument.")
+            return
+
+        old_filepath, new_filepath = data.split("::", 1)
+        self.analyzer.files.move_file(
+            old_filepath.decode("utf8"), new_filepath.decode("utf8"), self.pid
+        )
+
+    def dispatch(self, data):
+        response = "NOPE"
+
+        if not data or ":" not in data:
+            log.critical("Unknown command received from the monitor: %r",
+                         data.strip())
+        else:
+            # Backwards compatibility (old syntax is, e.g., "FILE_NEW:" vs the
+            # new syntax, e.g., "1234:FILE_NEW:").
+            if data[0].isupper():
+                command, arguments = data.strip().split(":", 1)
+                self.pid = None
+            else:
+                self.pid, command, arguments = data.strip().split(":", 2)
+
+            fn = getattr(self, "_handle_%s" % command.lower(), None)
+            if not fn:
+                log.critical("Unknown command received from the monitor: %r",
+                             data.strip())
+            else:
+                try:
+                    response = fn(arguments)
+                except:
+                    log.exception(
+                        "STAP command handler exception occurred (command "
+                        "%s args %r).", command, arguments
+                    )
+
+        return response
+
 
 class Analyzer:
     """Cuckoo Linux Analyzer.
@@ -59,6 +213,7 @@ class Analyzer:
     def __init__(self):
         self.config = None
         self.target = None
+        self.files = Files()
 
     def prepare(self):
         """Prepare env for analysis."""
@@ -78,6 +233,14 @@ class Analyzer:
             # Setting date and time.
             os.system("date -s \"{0}\"".format(clock.strftime("%y-%m-%d %H:%M:%S")))
 
+        # Initialize and start the Command Handler STAP server.
+        self.command_stap = STAPServer(
+            STAPDispatcher, self.config.stap,
+            dispatcher=CommandSTAPHandler(self)
+        )
+        self.command_stap.daemon = True
+        self.command_stap.start()
+
         # We update the target according to its category. If it's a file, then
         # we store the path.
         if self.config.category == "file":
@@ -89,8 +252,7 @@ class Analyzer:
     def complete(self):
         """End analysis."""
         # Dump all the notified files.
-        dump_files()
-
+        self.command_stap.stop()
         # Hell yeah.
         log.info("Analysis completed.")
 
@@ -330,6 +492,8 @@ class Analyzer:
                 log.warning("Exception running finish callback of auxiliary "
                             "module %s: %s", aux.__class__.__name__, e)
 
+        # Dump all the notified files.
+        self.files.dump_files()
         # Let's invoke the completion procedure.
         self.complete()
 
