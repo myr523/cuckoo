@@ -5,6 +5,12 @@
  # Based on the Systemtap "strace.stp" example, adapted to our needs
  */
 
+%{
+#include <linux/umh.h>
+#include <linux/kernel.h>
+#include <linux/stat.h>
+%}
+
 /* configuration options; set these with stap -G */
 global timestamp = 1     /* -Gtimestamp=0 means don't print a syscall timestamp */
 
@@ -17,6 +23,81 @@ probe begin  {
     /* list those syscalls that never .return */
     syscalls_nonreturn["exit"] = 1
     syscalls_nonreturn["exit_group"] = 1
+}
+
+function call_umh(opt:string, file:string) %{
+    char *argv[4];
+    char *envp[3];
+    argv[0] = "/root/.cuckoo/monitor";
+    argv[1] = STAP_ARG_opt;
+    argv[2] = STAP_ARG_file;
+    argv[3] = NULL;
+
+    envp[0] = "HOME=/";
+    envp[1] = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
+    envp[2] = NULL;
+
+    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+%}
+
+function is_regular_file:long(file:long) %{
+	struct file *f = (struct file *)(long)STAP_ARG_file;
+	STAP_RETVALUE = S_ISREG(f->f_inode->i_mode);
+%}
+
+// override tapset funtion d_name to avoid bug
+function d_name(dentry) { 
+    return kernel_string_n(@cast(dentry, "dentry")->d_name->name, @cast(dentry,"dentry")->d_name->len) 
+}
+
+// FILE_NEW
+probe syscall.write*.return {
+    if (pid() == target()) next         # skip our own helper process
+    if (!target_set_pid(pid())) next    # skip unrelated processes
+    if (@entry($fd) >= 0 && @entry($fd) <= 2) next  # skip stdin/stdout/stderr
+
+    // get filepath from fd
+    task = pid2task(pid())
+    file = task_fd_lookup(task, @entry($fd))
+    if (!is_regular_file(file)) next
+    
+    filepath = fullpath_struct_file(task, file)
+    // print(filepath . "\n")
+    call_umh("-n", filepath)
+}
+
+// FILE_DEL
+probe syscall.unlink {
+    if (pid() == target()) next         # skip our own helper process
+    if (!target_set_pid(pid())) next    # skip unrelated processes
+
+    filepath = pathname
+    // print(filepath . "\n")
+    call_umh("-d", filepath)
+}
+
+probe syscall.unlinkat {
+    if (pid() == target()) next         # skip our own helper process
+    if (!target_set_pid(pid())) next    # skip unrelated processes
+
+    task = pid2task(pid())
+    path = task_cwd_path(task)
+    cwd = fullpath_struct_path(path)
+    filepath = cwd . "/" . user_string($pathname)
+    // print(filepath . "\n")
+    call_umh("-d", filepath)
+}
+
+// FILE_MOVE
+// "/path/to/old::/path/to/new"
+probe syscall.rename.return {
+    if (pid() == target()) next         # skip our own helper process
+    if (!target_set_pid(pid())) next    # skip unrelated processes
+
+    old = @entry(kernel_string($oldname))
+    new = @entry(kernel_string($newname))
+    // print(sprintf("%s::%s", old, new) . "\n")
+    call_umh("-m", sprintf("%s::%s", old, new))
 }
 
 probe nd_syscall.* {
