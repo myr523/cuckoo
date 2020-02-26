@@ -76,7 +76,7 @@ output::
 Compile the kernel extension::
 
     $ wget https://raw.githubusercontent.com/cuckoosandbox/cuckoo/master/stuff/systemtap/strace.stp
-    $ sudo stap -p4 -r $(uname -r) strace.stp -m stap_ -v
+    $ sudo stap -g -p4 -r $(uname -r) strace.stp -m stap_ -v
 
 Once the compilation finishes you should see the file ``stap_.ko`` in the same
 folder. You will now be able to test the STAP kernel extension as follows::
