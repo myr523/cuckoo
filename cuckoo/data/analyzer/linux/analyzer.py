@@ -22,12 +22,13 @@ from lib.common.constants import PATHS
 from lib.common.exceptions import CuckooError, CuckooPackageError
 from lib.common.hashing import hash_file
 from lib.common.results import upload_to_host
+from lib.common.uploaddropped import upload_to_host_dropped
 from lib.core.config import Config
 from lib.core.startup import create_folders, init_logging
 from lib.core.stapserver import STAPServer, STAPDispatcher
 from modules import auxiliary
 
-log = logging.getLogger()
+log = logging.getLogger("analyzer")
 
 PID = os.getpid()
 FILES_LIST = set()
@@ -35,6 +36,8 @@ DUMPED_LIST = set()
 PROCESS_LIST = set()
 SEEN_LIST = set()
 PPID = Process(pid=PID).get_parent_pid()
+PRESERVE_SUFFIX = ".old"
+STAP_PROC_PATH = ""
 
 def add_pids(pids):
     """Add PID."""
@@ -59,28 +62,61 @@ class Files(object):
 
     def is_protected_filename(self, file_name):
         """Return whether or not to inject into a process with this name."""
-        return file_name.lower() in self.PROTECTED_NAMES
+        return file_name in self.PROTECTED_NAMES
+
+    def remove_suffix(self, filepath):
+        return filepath.replace(PRESERVE_SUFFIX, "")
 
     def add_pid(self, filepath, pid, verbose=True):
         """Track a process identifier for this file."""
-        if not pid or filepath.lower() not in self.files:
+        if not pid or filepath not in self.files:
             return
 
-        if pid not in self.files[filepath.lower()]:
-            self.files[filepath.lower()].append(pid)
+        if pid not in self.files[filepath]:
+            self.files[filepath].append(pid)
             verbose and log.info("Added pid %s for %r", pid, filepath)
 
     def add_file(self, filepath, pid=None):
         """Add filepath to the list of files and track the pid."""
-        if filepath.lower() not in self.files:
+        if filepath not in self.files:
             log.info(
                 "Added new file to list with pid %s and path %s",
                 pid, filepath.encode("utf8")
             )
-            self.files[filepath.lower()] = []
-            self.files_orig[filepath.lower()] = filepath
+            self.files[filepath] = []
+            self.files_orig[filepath] = filepath
 
         self.add_pid(filepath, pid, verbose=False)
+
+    def dump_delete_file(self, filepath):
+        """Dump a file to the host."""
+        if not os.path.isfile(filepath):
+            log.warning("File at path %r does not exist, skip.", filepath)
+            return False
+
+        # Check whether we've already dumped this file - in that case skip it.
+        try:
+            sha256 = hash_file(hashlib.sha256, filepath)
+            if sha256 in self.dumped:
+                return
+        except IOError as e:
+            log.info("Error dumping file from path \"%s\": %s", filepath, e)
+            return
+
+        filename = "%s_%s" % (sha256[:16], os.path.basename(self.remove_suffix(filepath)))
+        upload_path = os.path.join("files", filename)
+
+        try:
+            upload_to_host_dropped(
+                self.files_orig.get(filepath.lower(), filepath), PRESERVE_SUFFIX,
+                upload_path, self.files.get(filepath, [])
+            )
+            self.dumped.append(sha256)
+        except (IOError, socket.error) as e:
+            log.error(
+                "Unable to upload dropped file at path \"%s\": %s",
+                filepath, e
+            )
 
     def dump_file(self, filepath):
         """Dump a file to the host."""
@@ -102,10 +138,8 @@ class Files(object):
 
         try:
             upload_to_host(
-                # If available use the original filepath, the one that is
-                # not lowercased.
                 self.files_orig.get(filepath.lower(), filepath),
-                upload_path, self.files.get(filepath.lower(), [])
+                upload_path, self.files.get(filepath, [])
             )
             self.dumped.append(sha256)
         except (IOError, socket.error) as e:
@@ -114,22 +148,23 @@ class Files(object):
                 filepath, e
             )
 
+
     def delete_file(self, filepath, pid=None):
         """A file is about to removed and thus should be dumped right away."""
         self.add_pid(filepath, pid)
-        self.dump_file(filepath)
+        self.dump_delete_file(filepath)
 
         # Remove the filepath from the files list.
-        self.files.pop(filepath.lower(), None)
-        self.files_orig.pop(filepath.lower(), None)
+        self.files.pop(filepath, None)
+        self.files_orig.pop(filepath, None)
 
     def move_file(self, oldfilepath, newfilepath, pid=None):
         """A file will be moved - track this change."""
         self.add_pid(oldfilepath, pid)
-        if oldfilepath.lower() in self.files:
+        if oldfilepath in self.files:
             # Replace the entry with the new filepath.
-            self.files[newfilepath.lower()] = \
-                self.files.pop(oldfilepath.lower(), [])
+            self.files[newfilepath] = \
+                self.files.pop(oldfilepath, [])
 
     def dump_files(self):
         """Dump all pending files."""
@@ -157,8 +192,13 @@ class CommandSTAPHandler():
         """Notification of a file being removed (if it exists) - we have to
         dump it before it's being removed."""
         filepath = data.decode("utf8")
+        log.info("delete handler: %s", filepath)
+
+        # TODO: skip own PID
         if os.path.exists(filepath):
             self.analyzer.files.delete_file(filepath, self.pid)
+            # After preserve file, remove it
+            os.remove(filepath)
 
     def _handle_file_move(self, data):
         """A file is being moved - track these changes."""
@@ -233,14 +273,6 @@ class Analyzer:
             # Setting date and time.
             os.system("date -s \"{0}\"".format(clock.strftime("%y-%m-%d %H:%M:%S")))
 
-        # Initialize and start the Command Handler STAP server.
-        self.command_stap = STAPServer(
-            STAPDispatcher, self.config.stap,
-            dispatcher=CommandSTAPHandler(self)
-        )
-        self.command_stap.daemon = True
-        self.command_stap.start()
-
         # We update the target according to its category. If it's a file, then
         # we store the path.
         if self.config.category == "file":
@@ -251,8 +283,6 @@ class Analyzer:
 
     def complete(self):
         """End analysis."""
-        # Dump all the notified files.
-        self.command_stap.stop()
         # Hell yeah.
         log.info("Analysis completed.")
 
@@ -260,6 +290,8 @@ class Analyzer:
         """Run analysis.
         @return: operation status.
         """
+        global STAP_PROC_PATH
+        global PRESERVE_SUFFIX
         self.prepare()
 
         log.debug("Starting analyzer from: %s", os.getcwd())
@@ -321,6 +353,8 @@ class Analyzer:
             # Import the auxiliary module.
             try:
                 __import__(name, globals(), locals(), ["dummy"], -1)
+                PRESERVE_SUFFIX = ".old"
+                STAP_PROC_PATH = "cuckoo"
             except ImportError as e:
                 log.warning("Unable to import the auxiliary module "
                             "\"%s\": %s", name, e)
@@ -345,6 +379,23 @@ class Analyzer:
                 log.debug("Started auxiliary module %s",
                           aux.__class__.__name__)
                 aux_enabled.append(aux)
+
+        # Initialize and start the Command Handler STAP server.
+        file_handle = None
+        try:
+            file_handle = open("/proc/" + STAP_PROC_PATH, "r")
+            log.debug(STAP_PROC_PATH)
+        except Exception as e:
+            log.error(e)
+
+        if not file_handle:
+            log.error("cannot open proc file")
+        self.command_stap = STAPServer(
+            STAPDispatcher, file_handle,
+            dispatcher=CommandSTAPHandler(self)
+        )
+        self.command_stap.daemon = True
+        self.command_stap.start()
 
         # Start analysis package. If for any reason, the execution of the
         # analysis package fails, we have to abort the analysis.
@@ -459,6 +510,10 @@ class Analyzer:
             log.warning("The package \"%s\" package_files function raised an "
                         "exception: %s", package_name, e)
 
+        # stop STAPServer before stopped STAP module
+        self.command_stap.stop()
+        log.info("stop STAPServer")
+
         # Terminate the Auxiliary modules.
         for aux in sorted(aux_enabled, key=lambda x: x.priority):
             try:
@@ -491,6 +546,7 @@ class Analyzer:
             except Exception as e:
                 log.warning("Exception running finish callback of auxiliary "
                             "module %s: %s", aux.__class__.__name__, e)
+
 
         # Dump all the notified files.
         self.files.dump_files()

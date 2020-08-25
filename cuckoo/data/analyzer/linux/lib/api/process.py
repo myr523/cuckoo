@@ -36,7 +36,7 @@ class Process:
         except:
             log.critical("could not get process status for pid %u", self.pid)
         return {}
-
+    # マルウェア実行
     def execute(self, cmd):
         self.proc = proc = subprocess.Popen(cmd)
         self.pid = proc.pid

@@ -1,4 +1,4 @@
-/* Copyright (C) 2015-2017 Cuckoo Foundation.
+/* Copyright (C) 2015-2020 Cuckoo Foundation.
  # This file is part of Cuckoo Sandbox - http://www.cuckoosandbox.org
  # See the file 'docs/LICENSE' for copying permission.
  #
@@ -6,9 +6,19 @@
  */
 
 %{
-#include <linux/umh.h>
 #include <linux/kernel.h>
 #include <linux/stat.h>
+#include <linux/kfifo.h>
+#include <linux/proc_fs.h>
+#include <linux/fs.h>
+#include <linux/wait.h>
+
+#include <linux/kallsyms.h>
+%}
+
+%{
+#define MAX_PATH_LEN 1024
+#define FIFO_SIZE 4096
 %}
 
 /* configuration options; set these with stap -G */
@@ -19,25 +29,199 @@ global thread_scname%
 global thread_time%
 
 global syscalls_nonreturn
-probe begin  {
-    /* list those syscalls that never .return */
-    syscalls_nonreturn["exit"] = 1
-    syscalls_nonreturn["exit_group"] = 1
+
+/* lock for procfs read access */
+%{
+struct kfifo_rec_ptr_2 cuckoo;
+static DECLARE_WAIT_QUEUE_HEAD(read_wait);
+%}
+
+%{
+extern struct filename *filename_parentat(int dfd, struct filename *name,
+				unsigned int flags, struct path *parent,
+				struct qstr *last, int *type);
+typedef typeof(&filename_parentat) filename_parentat_fn;
+#define filename_parentat (* (filename_parentat_fn)kallsyms_filename_parentat)
+void *kallsyms_filename_parentat = NULL;
+%}
+
+%{
+extern struct filename *getname_kernel(const char * filename);
+typedef typeof(&getname_kernel) getname_kernel_fn;
+#define getname_kernel (* (getname_kernel_fn)kallsyms_getname_kernel)
+void *kallsyms_getname_kernel = NULL;
+%}
+
+%{
+extern struct dentry *__lookup_hash(const struct qstr *name,
+		struct dentry *base, unsigned int flags);
+typedef typeof(&__lookup_hash) __lookup_hash_fn;
+#define __lookup_hash (* (__lookup_hash_fn)kallsyms___lookup_hash)
+void *kallsyms___lookup_hash = NULL;
+%}
+
+%{
+extern void putname(struct filename *name);
+typedef typeof(&putname) putname_fn;
+#define putname (* (putname_fn)kallsyms_putname)
+void *kallsyms_putname = NULL;
+%}
+
+
+// set file operations
+%{
+static ssize_t fifo_read(struct file *file, char __user *buf, size_t size, loff_t *ppos)
+{
+	int ret;
+	char *str = NULL;
+	int copied;
+
+	if (file->f_flags & O_NONBLOCK)
+		ret = -EAGAIN;
+
+	if (!access_ok(VERIFY_WRITE, buf, size))
+    return -EFAULT;
+
+	ret = wait_event_interruptible(read_wait, kfifo_len(&cuckoo) != 0);
+  if (ret)
+    return ret;
+
+	ret = kfifo_to_user(&cuckoo, buf, kfifo_len(&cuckoo), &copied);
+	if (ret)
+		return -EFAULT;
+
+	printk(KERN_INFO "sent analyzer: %d\n", copied);
+
+	return ret ? ret : copied;
 }
 
-function call_umh(opt:string, file:string) %{
-    char *argv[4];
-    char *envp[3];
-    argv[0] = "/root/.cuckoo/monitor";
-    argv[1] = STAP_ARG_opt;
-    argv[2] = STAP_ARG_file;
-    argv[3] = NULL;
+static const struct file_operations kfifo_fops = {
+	.owner		= THIS_MODULE,
+	.read		= fifo_read
+};
+%}
 
-    envp[0] = "HOME=/";
-    envp[1] = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
-    envp[2] = NULL;
+function initialize:long(proc_file_path:string) %{
+  kallsyms_filename_parentat = (void*)kallsyms_lookup_name("filename_parentat");
+  if (kallsyms_filename_parentat == NULL) {
+    STAP_RETVALUE = -ENOMEM;
+  }
+  kallsyms_getname_kernel = (void*)kallsyms_lookup_name("getname_kernel");
+  if (kallsyms_getname_kernel == NULL) {
+    STAP_RETVALUE = -ENOMEM;
+  }
+  kallsyms___lookup_hash = (void*)kallsyms_lookup_name("__lookup_hash");
+  if (kallsyms___lookup_hash == NULL) {
+    STAP_RETVALUE = -ENOMEM;
+  }
+  kallsyms_putname = (void*)kallsyms_lookup_name("putname");
+  if (kallsyms_putname == NULL) {
+    STAP_RETVALUE = -ENOMEM;
+  }
 
-    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);
+  kfifo_alloc(&cuckoo, FIFO_SIZE, GFP_KERNEL);
+  if (proc_create(STAP_ARG_proc_file_path, 0, NULL, &kfifo_fops) == NULL) {
+    STAP_RETVALUE = -ENOMEM;
+  }
+
+  STAP_RETVALUE = 0;
+%}
+
+function finalize(proc_file_path:string) %{
+	remove_proc_entry(STAP_ARG_proc_file_path, NULL);
+	kfifo_free(&cuckoo);
+%}
+
+probe begin {
+  proc_file_path = "cuckoo"
+  initialize(proc_file_path)
+  /* list those syscalls that never .return */
+  syscalls_nonreturn["exit"] = 1
+  syscalls_nonreturn["exit_group"] = 1
+}
+
+probe end {
+  proc_file_path = "cuckoo"
+	finalize(proc_file_path)
+}
+
+
+function rename_file:long(oldname:string, newname:string, olddfd:long, newdfd:long) %{
+  struct dentry *old_dentry, *new_dentry;
+	struct dentry *trap;
+	struct path old_path, new_path;
+	struct qstr old_last, new_last;
+	int old_type, new_type;
+	struct inode *delegated_inode = NULL;
+	struct filename *from;
+	struct filename *to;
+	unsigned int lookup_flags = 0, target_flags = LOOKUP_RENAME_TARGET;
+	bool should_retry = false;
+	int flags = 0;
+  int error;
+
+retry:
+  from = filename_parentat(STAP_ARG_olddfd, getname_kernel(STAP_ARG_oldname), lookup_flags,
+				&old_path, &old_last, &old_type);
+	if (IS_ERR(from)) {
+		error = PTR_ERR(from);
+		goto exit;
+	}
+
+	to = filename_parentat(STAP_ARG_newdfd, getname_kernel(STAP_ARG_newname), lookup_flags,
+				&new_path, &new_last, &new_type);
+	if (IS_ERR(to)) {
+		error = PTR_ERR(to);
+		goto exit1;
+	}
+
+  trap = lock_rename(new_path.dentry, old_path.dentry);
+
+	old_dentry = __lookup_hash(&old_last, old_path.dentry, lookup_flags);
+	error = PTR_ERR(old_dentry);
+	if (IS_ERR(old_dentry))
+		goto exit3;
+	/* source must exist */
+	error = -ENOENT;
+	if (d_is_negative(old_dentry))
+		goto exit4;
+	new_dentry = __lookup_hash(&new_last, new_path.dentry, lookup_flags | target_flags);
+	error = PTR_ERR(new_dentry);
+	if (IS_ERR(new_dentry))
+		goto exit4;
+
+  	/* source should not be ancestor of target */
+	error = -EINVAL;
+	if (old_dentry == trap)
+		goto exit5;
+	/* target should not be an ancestor of source */
+	if (new_dentry == trap)
+		goto exit5;
+
+	error = vfs_rename(old_path.dentry->d_inode, old_dentry,
+			   new_path.dentry->d_inode, new_dentry,
+			   &delegated_inode, flags);
+exit5:
+	dput(new_dentry);
+exit4:
+	dput(old_dentry);
+exit3:
+	unlock_rename(new_path.dentry, old_path.dentry);
+exit2:
+	if (retry_estale(error, lookup_flags))
+		should_retry = true;
+	path_put(&new_path);
+	putname(to);
+exit1:
+	path_put(&old_path);
+	putname(from);
+	if (should_retry) {
+		should_retry = false;
+		lookup_flags |= LOOKUP_REVAL;
+		goto retry;
+	}
+exit:
+	STAP_RETVALUE = error;
 %}
 
 function is_regular_file:long(file:long) %{
@@ -45,113 +229,176 @@ function is_regular_file:long(file:long) %{
 	STAP_RETVALUE = S_ISREG(f->f_inode->i_mode);
 %}
 
-// override tapset funtion d_name to avoid bug
-function d_name(dentry) { 
-    return kernel_string_n(@cast(dentry, "dentry")->d_name->name, @cast(dentry,"dentry")->d_name->len) 
-}
-
-// FILE_NEW
-probe syscall.write*.return {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
-    if (@entry($fd) >= 0 && @entry($fd) <= 2) next  # skip stdin/stdout/stderr
-
-    // get filepath from fd
-    task = pid2task(pid())
-    file = task_fd_lookup(task, @entry($fd))
-    if (!is_regular_file(file)) next
-    
-    filepath = fullpath_struct_file(task, file)
-    // print(filepath . "\n")
-    call_umh("-n", filepath)
-}
-
-// FILE_DEL
-probe syscall.unlink {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
-
-    filepath = pathname
-    // print(filepath . "\n")
-    call_umh("-d", filepath)
-}
+function send_command(command:string) %{
+	printk(KERN_INFO "%s\n", STAP_ARG_command);
+  printk(KERN_INFO "write kfifo: %d\n", kfifo_in(&cuckoo, STAP_ARG_command, strlen(STAP_ARG_command)));
+	wake_up_interruptible(&read_wait);
+%}
 
 probe syscall.unlinkat {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
+	if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
+  preserve_prefix = ".old"                # get file prefix from command line argument
 
-    task = pid2task(pid())
-    path = task_cwd_path(task)
-    cwd = fullpath_struct_path(path)
-    filepath = cwd . "/" . user_string($pathname)
-    // print(filepath . "\n")
-    call_umh("-d", filepath)
+  filepath = user_string($pathname)
+  preserve_filepath = user_string($pathname) . preserve_prefix
+  rename_file(filepath, preserve_filepath, $dfd, $dfd)
+
+	# convert relative path to absolute path
+	task = pid2task(pid())
+  path = task_cwd_path(task)
+  cwd = fullpath_struct_path(path)
+	command = sprintf("%d:%s:%s", pid(), "FILE_DEL", cwd . "/" . preserve_filepath . "\n")
+	send_command(command)
+}
+
+probe syscall.unlink {
+	if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
+  preserve_prefix = ".old"                # get file prefix from command line argument
+
+
+  filepath = user_string($pathname)
+  preserve_filepath = user_string($pathname) . preserve_prefix
+  rename_file(filepath, preserve_filepath, %{AT_FDCWD%}, %{AT_FDCWD%})
+	command = sprintf("%d:%s:%s", pid(), "FILE_DEL", preserve_filepath) . "\n"
+	send_command(command)
+}
+
+probe syscall.unlinkat.return {
+  $return = 0
+}
+
+probe syscall.unlink.return {
+  $return = 0
+}
+
+
+// FILE_NEW
+probe syscall.write.return {
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
+  if (@entry($fd) >= 0 && @entry($fd) <= 2) next  # skip stdin/stdout/stderr
+  if ($return < 1) next      # didn't write
+
+  // get filepath from fd
+  task = pid2task(pid())
+  file = task_fd_lookup(task, @entry($fd))
+  if (!is_regular_file(file)) next
+
+  filepath = fullpath_struct_file(task, file)
+  command = sprintf("%d:%s:%s", pid(), "FILE_NEW", filepath) . "\n"
+  send_command(command)
+}
+
+probe syscall.writev.return {
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
+  if (@entry($fd) >= 0 && @entry($fd) <= 2) next  # skip stdin/stdout/stderr
+  if ($return < 1) next      # didn't write
+
+  // get filepath from fd
+  task = pid2task(pid())
+  file = task_fd_lookup(task, @entry($fd))
+  if (!is_regular_file(file)) next
+
+  filepath = fullpath_struct_file(task, file)
+  command = sprintf("%d:%s:%s", pid(), "FILE_NEW", filepath) . "\n"
+  send_command(command)
 }
 
 // FILE_MOVE
 // "/path/to/old::/path/to/new"
 probe syscall.rename.return {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
 
-    old = @entry(kernel_string($oldname))
-    new = @entry(kernel_string($newname))
-    // print(sprintf("%s::%s", old, new) . "\n")
-    call_umh("-m", sprintf("%s::%s", old, new))
+  task = pid2task(pid())
+  path = task_cwd_path(task)
+  cwd = fullpath_struct_path(path)
+
+  old = @entry(kernel_string($oldname))
+  if (substr(old, 0, 1) != "/") {
+    // relative path
+    old = cwd . "/" . old
+  }
+  new = @entry(kernel_string($newname))
+  if (substr(new, 0, 1) != "/") {
+    // relative path
+    new = cwd . "/" . new
+  }
+  // print(sprintf("%s::%s", old, new) . "\n")
+  command = sprintf("%d:%s:%s", pid(), "FILE_MOVE", sprintf("%s::%s", old, new)) . "\n"
+  send_command(command)
+}
+
+probe syscall.renameat.return {
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
+
+  old = @entry(kernel_string($oldname))
+  new = @entry(kernel_string($newname))
+  // print(sprintf("%s::%s", old, new) . "\n")
+  # convert relative path to absolute path
+  task = pid2task(pid())
+  path = task_cwd_path(task)
+  cwd = fullpath_struct_path(path)
+  command = sprintf("%d:%s:%s", pid(), "FILE_MOVE", sprintf("%s::%s", cwd . "/" . old, cwd . "/" . new)) . "\n"
+  send_command(command)
 }
 
 probe nd_syscall.* {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
 
-    t = tid()
+  t = tid()
 
-    /* last syscall that could've returned didn't */
-    if (thread_argstr[t] != "")
-        report(thread_scname[t], thread_argstr[t], "")
+  /* last syscall that could've returned didn't */
+  if (thread_argstr[t] != "")
+      report(thread_scname[t], thread_argstr[t], "")
 
-    thread_argstr[t] = argstr
-    thread_scname[t] = name
-    if (timestamp)
-        thread_time[t] = gettimeofday_us()
+  thread_argstr[t] = argstr
+  thread_scname[t] = name
+  if (timestamp)
+      thread_time[t] = gettimeofday_us()
 
-    if (name in syscalls_nonreturn)
-        report(name, argstr, "")
+  if (name in syscalls_nonreturn)
+      report(name, argstr, "")
 }
 
 probe nd_syscall.*.return {
-    if (pid() == target()) next         # skip our own helper process
-    if (!target_set_pid(pid())) next    # skip unrelated processes
+  if (pid() == target()) next         # skip our own helper process
+  if (!target_set_pid(pid())) next    # skip unrelated processes
 
-    report(name, thread_argstr[tid()], retstr)
+  report(name, thread_argstr[tid()], retstr)
 }
 
 function report(syscall_name, syscall_argstr, syscall_retstr) {
-    t = tid()
+  t = tid()
 
-    if (timestamp) {
-        then = thread_time[t]
+  if (timestamp) {
+      then = thread_time[t]
 
-        if (timestamp)
-            prefix = sprintf("%s.%06d ", ctime(then / 1000000), then % 1000000)
+      if (timestamp)
+          prefix = sprintf("%s.%06d ", ctime(then / 1000000), then % 1000000)
 
-        delete thread_time[t]
-    }
+      delete thread_time[t]
+  }
 
-    /* add a thread-id string in lots of cases, except if
-       stap strace.stp -c SINGLE_THREADED_CMD */
-    if (tid() != target()) {
-        prefix .= sprintf("%s@%x[%d] ", execname(), uaddr(), t)
-    }
+  /* add a thread-id string in lots of cases, except if
+      stap strace.stp -c SINGLE_THREADED_CMD */
+  if (tid() != target()) {
+      prefix .= sprintf("%s@%x[%d] ", execname(), uaddr(), t)
+  }
 
-    syscall_argstr = str_replace(syscall_argstr, "(", "\\x28")
-    syscall_argstr = str_replace(syscall_argstr, ")", "\\x29")
+  syscall_argstr = str_replace(syscall_argstr, "(", "\\x28")
+  syscall_argstr = str_replace(syscall_argstr, ")", "\\x29")
 
-    if (syscall_retstr == "")
-        printf("%s%s(%s)\n", prefix, syscall_name, syscall_argstr)
-    else
-        printf("%s%s(%s) = %s\n", prefix, syscall_name, syscall_argstr, syscall_retstr)
+  if (syscall_retstr == "")
+      printf("%s%s(%s)\n", prefix, syscall_name, syscall_argstr)
+  else
+      printf("%s%s(%s) = %s\n", prefix, syscall_name, syscall_argstr, syscall_retstr)
 
-    delete thread_argstr[t]
-    delete thread_scname[t]
+  delete thread_argstr[t]
+  delete thread_scname[t]
 }

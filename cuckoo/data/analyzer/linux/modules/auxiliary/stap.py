@@ -10,6 +10,7 @@ import time
 from lib.common.abstracts import Auxiliary
 from lib.common.results import NetlogFile
 from lib.core.config import Config
+from lib.common.utils import random_string
 
 log = logging.getLogger(__name__)
 
@@ -20,6 +21,14 @@ class STAP(Auxiliary):
     def __init__(self):
         self.config = Config(cfg="analysis.conf")
         self.proc = None
+        self.preserve_suffix = "." + random_string(6, 12)
+        self.proc_path = random_string(6, 12)
+
+    def get_prefix(self):
+        return self.preserve_suffix
+
+    def get_proc_path(self):
+        return self.proc_path
 
     def start(self):
         # helper function locating the stap module
